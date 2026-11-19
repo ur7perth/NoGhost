@@ -1,0 +1,16 @@
+name: GhostHit
+version: '${project.version}'
+main: com.ghosthit.plugin.GhostHit
+api-version: '1.20'
+description: Fixes ghost hits on Paper 1.20.1 (Java + Bedrock)
+softdepend: [WorldGuard, floodgate, Geyser-Spigot]
+commands:
+  ghosthit:
+    description: Toggle GhostHit fix
+    usage: /<command> <on|off>
+    permission: ghosthit.admin
+    aliases: [gh]
+permissions:
+  ghosthit.admin:
+    description: Allows toggling GhostHit
+    default: op
