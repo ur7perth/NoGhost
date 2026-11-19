@@ -4,6 +4,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.FluidCollisionMode;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.command.Command;
@@ -14,10 +15,11 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
-import org.bukkit.event.entity.EntityDamageEvent.DamageCause;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent.DamageCause;
 import org.bukkit.event.player.PlayerAnimationEvent;
 import org.bukkit.event.player.PlayerAnimationType;
+import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -39,13 +41,15 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
     private int checkDelay;
     private double javaMinCooldown;
 
-    private boolean bedrockNoCrit;
+    private boolean bedrockFixCrit;
+    private double bedrockMinFall;
     private double bedrockMultiplier;
     private double bedrockMinCooldown;
     private String bedrockPrefix;
 
-    /** آخر تك سجل فيه اللاعب محاولة ضرب (حتى لو انلغت بسبب حماية) */
     private final Map<UUID, Integer> lastAttempt = new HashMap<>();
+    /** أعلى نقطة Y وصلها اللاعب وهو بالهواء (تتبع خاص فينا) */
+    private final Map<UUID, Double> peakY = new HashMap<>();
     private boolean applying = false;
 
     private Object floodgateApi;
@@ -60,7 +64,6 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
             getCommand("ghosthit").setExecutor(this);
             getCommand("ghosthit").setTabCompleter(this);
         }
-        // تأخير بسيط عشان Floodgate يكون تحمّل
         Bukkit.getScheduler().runTask(this, this::setupFloodgate);
         getLogger().info("GhostHit enabled. State: " + (enabled ? "ON" : "OFF"));
     }
@@ -72,7 +75,8 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
         rayTolerance = getConfig().getDouble("ray-tolerance", 0.1);
         checkDelay = Math.max(1, getConfig().getInt("check-delay-ticks", 2));
         javaMinCooldown = getConfig().getDouble("min-attack-cooldown", 0.0);
-        bedrockNoCrit = getConfig().getBoolean("bedrock.no-critical", true);
+        bedrockFixCrit = getConfig().getBoolean("bedrock.fix-fake-critical", true);
+        bedrockMinFall = getConfig().getDouble("bedrock.min-fall-distance", 0.1);
         bedrockMultiplier = getConfig().getDouble("bedrock.damage-multiplier", 1.0);
         bedrockMinCooldown = getConfig().getDouble("bedrock.min-attack-cooldown", 0.9);
         bedrockPrefix = getConfig().getString("bedrock.name-prefix", ".");
@@ -91,7 +95,7 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
 
     private boolean isBedrock(Player p) {
         UUID id = p.getUniqueId();
-        if (id.getMostSignificantBits() == 0L) return true; // Floodgate UUID
+        if (id.getMostSignificantBits() == 0L) return true;
         if (floodgateApi != null && floodgateCheck != null) {
             try {
                 if ((boolean) floodgateCheck.invoke(floodgateApi, id)) return true;
@@ -101,7 +105,42 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
     }
 
     // ------------------------------------------------------------------
-    // تسجيل محاولات الضرب (حتى المنلغية بالحماية = ما نتدخل فيها)
+    // تتبع السقوط الحقيقي (بدون الاعتماد على onGround / fallDistance)
+    // ------------------------------------------------------------------
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onMove(PlayerMoveEvent e) {
+        if (!enabled || e.getTo() == null) return;
+        Player p = e.getPlayer();
+        if (!isBedrock(p)) return;
+        double y = e.getTo().getY();
+        if (hasGroundBelow(e.getTo()) || p.isInWater() || p.isClimbing() || p.isGliding()) {
+            peakY.put(p.getUniqueId(), y);
+        } else {
+            peakY.merge(p.getUniqueId(), y, Math::max);
+        }
+    }
+
+    private boolean hasGroundBelow(Location loc) {
+        World w = loc.getWorld();
+        double[] off = {-0.3, 0.0, 0.3};
+        for (double dx : off) {
+            for (double dz : off) {
+                Location l = loc.clone().add(dx, -0.1, dz);
+                if (w.getBlockAt(l).getType().isSolid()) return true;
+            }
+        }
+        return false;
+    }
+
+    /** هل اللاعب فعلاً ساقط الحين (كرتكل حقيقي)؟ */
+    private boolean isReallyFalling(Player p) {
+        if (hasGroundBelow(p.getLocation())) return false;
+        if (p.getVelocity().getY() >= 0) return false;
+        Double peak = peakY.get(p.getUniqueId());
+        if (peak == null) return false;
+        return (peak - p.getLocation().getY()) >= bedrockMinFall;
+    }
+
     // ------------------------------------------------------------------
     @EventHandler(priority = EventPriority.MONITOR)
     public void onAttackMonitor(EntityDamageByEntityEvent e) {
@@ -111,7 +150,7 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
     }
 
     // ------------------------------------------------------------------
-    // لاعبين البيدروك: منع الكرتكل + مضاعف الدمج
+    // البيدروك: نلغي الكرتكل فقط إذا السيرفر حسبه كرتكل واللاعب مو ساقط فعلاً
     // ------------------------------------------------------------------
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onBedrockDamage(EntityDamageByEntityEvent e) {
@@ -121,15 +160,16 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
         if (!(e.getEntity() instanceof Player)) return;
 
         double dmg = e.getDamage();
-        if (bedrockNoCrit && wouldCrit(p)) {
-            dmg = dmg / 1.5;
+        if (bedrockFixCrit && serverWouldCrit(p) && !isReallyFalling(p)) {
+            dmg = dmg / 1.5; // كرتكل وهمي (قلتش) => دمج عادي
         }
         dmg *= bedrockMultiplier;
         e.setDamage(dmg);
     }
 
+    /** نفس شروط الكرتكل بالسيرفر الأصلي */
     @SuppressWarnings("deprecation")
-    private boolean wouldCrit(Player p) {
+    private boolean serverWouldCrit(Player p) {
         return p.getAttackCooldown() > 0.9f
                 && p.getFallDistance() > 0.0f
                 && !p.isOnGround()
@@ -164,7 +204,6 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
             if (!enabled) return;
             if (!attacker.isOnline() || !target.isOnline()) return;
 
-            // السيرفر سجل محاولة ضرب (دمج أو إلغاء بحماية) => مو GhostHit
             Integer last = lastAttempt.get(attacker.getUniqueId());
             if (last != null && last >= swingTick - 1) return;
 
@@ -188,7 +227,6 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
         if (t.isDead() || t.isInvulnerable()) return false;
         GameMode gm = t.getGameMode();
         if (gm != GameMode.SURVIVAL && gm != GameMode.ADVENTURE) return false;
-        // فريمات الحماية بعد الضرب (ضربة مرفوضة بشكل طبيعي مو GhostHit)
         return t.getNoDamageTicks() <= t.getMaximumNoDamageTicks() / 2.0;
     }
 
@@ -213,7 +251,6 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
 
         applying = true;
         try {
-            // يطلق EntityDamageByEntityEvent => WorldGuard وغيره يقدرون يلغونه
             target.damage(dmg, attacker);
         } finally {
             applying = false;
@@ -223,7 +260,7 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
 
     private double computeDamage(Player attacker, float cd) {
         AttributeInstance attr = attacker.getAttribute(Attribute.GENERIC_ATTACK_DAMAGE);
-        double base = attr != null ? attr.getValue() : 1.0; // يشمل السيف + Strength
+        double base = attr != null ? attr.getValue() : 1.0;
 
         ItemStack item = attacker.getInventory().getItemInMainHand();
         double ench = 0;
@@ -231,16 +268,16 @@ public final class GhostHit extends JavaPlugin implements Listener, TabExecutor 
         if (sharp > 0) ench = 0.5 * sharp + 0.5;
 
         double scaled = base * (0.2 + cd * cd * 0.8);
-        return scaled + ench * cd; // بدون كرتكل
+        return scaled + ench * cd;
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent e) {
-        lastAttempt.remove(e.getPlayer().getUniqueId());
+        UUID id = e.getPlayer().getUniqueId();
+        lastAttempt.remove(id);
+        peakY.remove(id);
     }
 
-    // ------------------------------------------------------------------
-    // الأوامر
     // ------------------------------------------------------------------
     @Override
     public boolean onCommand(CommandSender s, Command c, String label, String[] a) {
